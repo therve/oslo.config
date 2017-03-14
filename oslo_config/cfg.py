@@ -597,6 +597,26 @@ class DefaultValueError(Error, ValueError):
     """Raised if a default config type does not fit the opt type."""
 
 
+class EtcdConnectionError(Error):
+    """Raised if an error occurs connecting to an etcd server."""
+
+    def __init__(self, url):
+        self.url = url
+
+    def __str__(self):
+        return "Failed to connect to etcd server at '%s'" % self.url
+
+
+class EtcdDirectoryNotFound(Error):
+    """Raised if the base directory wasn't found in etcd."""
+
+    def __init__(self, key):
+        self.key = key
+
+    def __str__(self):
+        return "Failed to read config key '%s' from etcd" % self.key
+
+
 def _fixpath(p):
     """Apply tilde expansion and absolutization to a path."""
     return os.path.abspath(os.path.expanduser(p))
@@ -1554,6 +1574,77 @@ class SubCommandOpt(Opt):
             self.handler(subparsers)
 
 
+def _get_etcd_config(values, namespace):
+    import etcd
+    from six.moves import urllib
+    url = urllib.parse.urlparse(values)
+    ret = {}
+    base_key = url.path
+    client = etcd.client.Client(host=url.hostname,
+                                port=url.port,
+                                protocol=url.scheme)
+    try:
+        tree = client.read(base_key, recursive=True)
+    except etcd.EtcdConnectionFailed:
+        raise EtcdConnectionError(values)
+    except etcd.EtcdKeyNotFound:
+        raise EtcdDirectoryNotFound(base_key)
+    else:
+        for child in tree.children:
+            container, key = os.path.split(child.key)
+            if container != base_key:
+                section = os.path.basename(container)
+            else:
+                section = 'DEFAULT'
+            ret.setdefault(section, {})[key] = [child.value]
+
+    namespace._add_parsed_config_file(ret, ret)
+    namespace._parse_cli_opts_from_config_file(ret, ret)
+
+
+class _ConfigEtcdOpt(Opt):
+
+    """The --etcd-server option.
+
+    This is an private option type which handles the special processing
+    required for --etcd-server options.
+
+    As each --etcd-server option is encountered on the command line, we
+    parse the URL, connect to the etcd server, and store the found values in
+    the _Namespace object.  This allows us to properly handle the precedence of
+    --etcd-server options over previous command line arguments, but not over
+    subsequent arguments.
+
+    .. versionadded:: XX
+    """
+
+    class ConfigEtcdAction(argparse.Action):
+
+        """An argparse action for --etcd-server.
+
+        As each --etcd-server option is encountered, this action sets the
+        etcd_server on the _Namespace object but also retrieve the
+        configuration values and store them in the _Namespace object.
+        """
+
+        def __call__(self, parser, namespace, values, option_string=None):
+            if getattr(namespace, self.dest, None) is None:
+                setattr(namespace, self.dest, [])
+            items = getattr(namespace, self.dest)
+            items.append(values)
+
+            _get_etcd_config(values, namespace)
+
+    def __init__(self, name, **kwargs):
+        super(_ConfigEtcdOpt, self).__init__(name, lambda x: x, **kwargs)
+
+    def _get_argparse_kwargs(self, group, **kwargs):
+        """Extends the base argparse keyword dict for the etcd server opt."""
+        kwargs = super(_ConfigEtcdOpt, self)._get_argparse_kwargs(group)
+        kwargs['action'] = self.ConfigEtcdAction
+        return kwargs
+
+
 class _ConfigFileOpt(Opt):
 
     """The --config-file option.
@@ -2261,6 +2352,12 @@ class ConfigOpts(collections.Mapping):
     @staticmethod
     def _make_config_options(default_config_files, default_config_dirs):
         return [
+            _ConfigEtcdOpt('etcd-server',
+                           metavar='ETCD_SERVER',
+                           help=('URL to an etcd server. Multiple servers '
+                                 'can be specified, with values in later '
+                                 'servers taking precedence. The base key '
+                                 'is specified as the path in the URL.')),
             _ConfigFileOpt('config-file',
                            default=default_config_files,
                            metavar='PATH',
